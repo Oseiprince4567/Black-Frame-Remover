@@ -1,0 +1,24 @@
+[general]
+name=Black Frame Remover
+qgisMinimumVersion=3.0
+description=Removes the black border/frame from georeferenced rasters and aerial imagery using Clip by Mask Layer with alpha channel transparency.
+version=1.0.0
+license=GPL-2.0+
+author=Prince Osei Boateng
+email=oseiboateng93@gmail.com
+
+about=When georeferencing old maps or aerial imagery in QGIS, the output raster often has an unwanted black frame around the actual image content. This plugin automates the removal by detecting the valid image area, generating a mask polygon, and clipping the raster with alpha transparency. Replicating the manual workflow of Raster > Extraction > Clip Raster by Mask Layer with the alpha channel box ticked.
+
+tracker=https://github.com/Oseiprince4567/Black-Frame-Remover/issues
+repository=https://github.com/Oseiprince4567/Black-Frame-Remover
+
+changelog=
+    1.0.0 - Initial release.
+
+tags=raster, georeferencing, aerial imagery, clip, nodata, black frame, historical maps, remote sensing, ordnance
+
+homepage=https://github.com/Oseiprince4567/Black-Frame-Remover
+category=Raster
+icon=icon.png
+experimental=False
+deprecated=False
