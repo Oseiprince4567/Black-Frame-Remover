@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Black Frame Remover - main.py  v1.1
+Black Frame Remover - main.py  v1.0.0
 All plugin logic in one file: toolbar action, dialog UI, and processing.
 
 FIX v1.1: Added morphological closing to prevent valid dark pixels
