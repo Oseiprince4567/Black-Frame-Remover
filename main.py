@@ -1,13 +1,33 @@
 # -*- coding: utf-8 -*-
 """
-Black Frame Remover - main.py  v1.0.0
+Black Frame Remover: main.py  v1.1.0
 All plugin logic in one file: toolbar action, dialog UI, and processing.
 
-FIX v1.1: Added morphological closing to prevent valid dark pixels
-along image edges from being incorrectly treated as black border.
+v1.0.0 Initial release.
+         Morphological closing added to prevent valid dark pixels along image
+         edges from being incorrectly treated as black border.
+
+v1.1.0 Performance fix for large rasters.
+         * Default edge smoothing changed from 21 px to 1 px (off by default).
+           At 21 px the closing step stalled on images larger than ~10 000 px
+           (sliding_window_view at k=21 on an 11k x 10k image requires ~102
+           billion boolean operations). Users who need hole-filling for dark
+           interior content (forests, shadows, dark fields near the border)
+           can still raise the slider.
+         * Added skip: when closing_size = 1 the morphological closing step is
+           skipped entirely — the mask is passed through unchanged. This makes
+           the default workflow on large rasters dramatically faster.
+         * Band arrays are now read in native dtype (typically uint8) instead
+           of being cast to float32. Avoids ~4x memory blowup during
+           thresholding on large multi-band rasters.
+         * Progress bar switches to indeterminate mode during the closing step
+           so the UI does not appear frozen on higher slider values.
+
+Scope: this plugin removes DARK/BLACK borders only. It will not work
+correctly on rasters with white, gray, or other light-coloured backgrounds.
 
 Copyright (C) 2026 Prince Osei Boateng
-Reach out through email please: oseiboateng93@gmail.com
+Contact: oseiboateng93@gmail.com
 """
 
 import os
@@ -15,7 +35,7 @@ import numpy as np
 from osgeo import gdal
 gdal.UseExceptions()
 
-import processing  # QGIS Processing framework
+import processing  # QGIS Processing framework for running algorithms like polygonize and clip by mask
 
 from qgis.PyQt.QtWidgets import (
     QAction, QDialog, QVBoxLayout, QHBoxLayout,
@@ -30,10 +50,11 @@ from qgis.core import QgsRasterLayer, QgsProject
 plugin_dir = os.path.dirname(__file__)
 
 
-# ── Background Worker Thread ───────────────────────────────────────────────────
+#//Background Worker Thread/////
 
 class WorkerThread(QThread):
     progress = pyqtSignal(int, str)
+    busy     = pyqtSignal(bool, str)   # True = enter indeterminate mode
     finished = pyqtSignal(dict)
 
     def __init__(self, input_path, output_path, threshold, closing_size, add_alpha):
@@ -50,76 +71,91 @@ class WorkerThread(QThread):
     def _report(self, percent, message):
         self.progress.emit(percent, message)
 
+    def _busy(self, on, message=''):
+        self.busy.emit(on, message)
+
     def _process(self):
         """
-        Step 1  — Build initial mask raster (threshold)
-        Step 1b — Morphological closing (THE FIX for pixel loss)
-        Step 2  — Polygonize mask → vector polygon
-        Step 3  — Clip raster by mask layer + alpha channel
+        Step 1  : Build initial mask raster (threshold)
+        Step 1b : Morphological closing (optional; skipped when closing_size = 1)
+        Step 2  : Polygonize mask → vector polygon
+        Step 3  : Clip raster by mask layer + alpha channel
         """
-        base             = self.output_path.replace('.tif','').replace('.tiff','')
+        base             = self.output_path.replace('.tif', '').replace('.tiff', '')
         temp_mask_raster = base + '_temp_mask.tif'
         temp_mask_vector = base + '_temp_mask.gpkg'
         temp_filtered    = base + '_temp_filtered.gpkg'
 
         try:
             # ── Step 1: Build initial mask ─────────────────────────────────────
-            self._report(5, 'Step 1/3 — Detecting black border pixels...')
+            self._report(5, 'Step 1/3: Detecting black border pixels...')
 
             ds = gdal.Open(self.input_path, gdal.GA_ReadOnly)
             if ds is None:
-                return {'success': False, 'message': 'Cannot open raster. Check the file path.'}
+                return {'success': False,
+                        'message': 'Cannot open raster. Check the file path.'}
 
             geo_transform = ds.GetGeoTransform()
             projection    = ds.GetProjection()
             width, height = ds.RasterXSize, ds.RasterYSize
             n_bands       = ds.RasterCount
 
-            # Pixel is valid if ANY band exceeds threshold
+            # Pixel is valid if ANY band exceeds threshold.
+            # Read in native dtype (typically uint8) — no float32 cast needed
+            # for a threshold comparison; avoids ~4x memory blowup on large
+            # multi-band rasters.
             valid_mask = np.zeros((height, width), dtype=bool)
             for b in range(1, n_bands + 1):
-                arr = ds.GetRasterBand(b).ReadAsArray().astype(np.float32)
+                arr = ds.GetRasterBand(b).ReadAsArray()
                 valid_mask |= (arr > self.threshold)
             ds = None
 
-            # ── Step 1b: Morphological closing (THE FIX) ───────────────────────
+            # ── Step 1b: Morphological closing ─────────────────────────────────
             #
-            # The problem: historical aerial images have dark pixels near their
+            # Purpose: historical aerial images can have dark pixels near their
             # edges (dark fields, forests, shadows) whose values are close to 0.
-            # A simple threshold incorrectly marks these as "black border" and
-            # removes them — eating into the real image content.
+            # A pure threshold can mark these as "black border" and eat into
+            # real image content. Morphological closing (dilate then erode)
+            # fills small dark holes surrounded by valid content while leaving
+            # the true outer black border untouched.
             #
-            # The fix — morphological closing (dilation then erosion):
-            #
-            #   DILATION:  expands the True (valid) region outward by closing_size.
-            #              This "reaches into" the black border and fills dark holes
-            #              inside the image content.
-            #
-            #   EROSION:   shrinks the expanded region back inward by the same amount.
-            #              This restores the outer boundary to roughly its original
-            #              position, but now the interior holes are filled.
-            #
-            # Net result: dark pixels SURROUNDED by valid content stay valid.
-            #             Only the true outer black border (no valid neighbours)
-            #             is correctly removed.
-            #
-            # Example: closing_size=21 means a 21x21 pixel neighbourhood.
-            # A dark forest pixel 10px inside the image edge will be kept.
+            # Tradeoff: larger closing sizes fill larger holes but can also
+            # trim content from the corners of tilted/rotated scans, because
+            # the erosion step cannot distinguish "narrow tip of a tilted
+            # rectangle" from "thin spur of noise". The default is 1 (no-op)
+            # and users who see interior hole-punching can dial it up.
 
-            self._report(20, 'Refining mask edges (filling dark holes inside image)...')
+            if self.closing_size <= 1:
+                # No-op: skip the closing step entirely for maximum speed.
+                closed_mask = valid_mask
+                self._report(30, 'Edge smoothing off (closing_size = 1): skipping...')
+            else:
+                self._report(20, 'Refining mask edges (filling dark holes inside image)...')
 
-            from numpy.lib.stride_tricks import sliding_window_view
-            pad = self.closing_size // 2
+                from numpy.lib.stride_tricks import sliding_window_view
+                pad = self.closing_size // 2
 
-            # Dilation: pixel becomes True if ANY neighbour is True
-            padded  = np.pad(valid_mask, pad, mode='constant', constant_values=False)
-            windows = sliding_window_view(padded, (self.closing_size, self.closing_size))
-            dilated = windows.any(axis=(-2, -1))
+                # The closing call is a long uninterruptible operation at high
+                # slider values. Switch the progress bar to indeterminate mode
+                # so the UI does not appear frozen.
+                self._busy(True, 'Refining mask edges (this may take a moment on large images)...')
+                try:
+                    # Dilation: pixel becomes True if ANY neighbour in the
+                    # closing_size x closing_size window is True
+                    padded  = np.pad(valid_mask, pad,
+                                     mode='constant', constant_values=False)
+                    windows = sliding_window_view(
+                                  padded, (self.closing_size, self.closing_size))
+                    dilated = windows.any(axis=(-2, -1))
 
-            # Erosion: pixel stays True only if ALL neighbours are True
-            padded2  = np.pad(dilated, pad, mode='constant', constant_values=False)
-            windows2 = sliding_window_view(padded2, (self.closing_size, self.closing_size))
-            closed_mask = windows2.all(axis=(-2, -1))
+                    # Erosion: pixel stays True only if ALL neighbours are True
+                    padded2  = np.pad(dilated, pad,
+                                      mode='constant', constant_values=False)
+                    windows2 = sliding_window_view(
+                                   padded2, (self.closing_size, self.closing_size))
+                    closed_mask = windows2.all(axis=(-2, -1))
+                finally:
+                    self._busy(False, '')
 
             # Write cleaned mask as GeoTIFF
             driver  = gdal.GetDriverByName('GTiff')
@@ -133,7 +169,7 @@ class WorkerThread(QThread):
             mask_ds = None
 
             # ── Step 2: Polygonize mask ────────────────────────────────────────
-            self._report(40, 'Step 2/3 — Building polygon around image content...')
+            self._report(40, 'Step 2/3: Building polygon around image content...')
 
             processing.run('gdal:polygonize', {
                 'INPUT':               temp_mask_raster,
@@ -153,9 +189,10 @@ class WorkerThread(QThread):
             })
 
             # ── Step 3: Clip raster by mask + alpha channel ────────────────────
-            self._report(65, 'Step 3/3 — Clipping raster (alpha channel enabled)...')
+            self._report(65, 'Step 3/3:Clipping raster (alpha channel enabled)...')
 
-            mask_source = temp_filtered if os.path.exists(temp_filtered) else temp_mask_vector
+            mask_source = (temp_filtered if os.path.exists(temp_filtered)
+                           else temp_mask_vector)
 
             result = processing.run('gdal:cliprasterbymasklayer', {
                 'INPUT':           self.input_path,
@@ -164,7 +201,7 @@ class WorkerThread(QThread):
                 'TARGET_CRS':      None,
                 'TARGET_EXTENT':   None,
                 'NODATA':          None,
-                'ALPHA_BAND':      self.add_alpha,   # ✅ alpha channel ticked
+                'ALPHA_BAND':      self.add_alpha,
                 'CROP_TO_CUTLINE': True,
                 'KEEP_RESOLUTION': True,
                 'SET_RESOLUTION':  False,
@@ -182,7 +219,7 @@ class WorkerThread(QThread):
                         'message': 'Clip by mask failed. Check output path and disk space.'}
 
             # ── Cleanup ────────────────────────────────────────────────────────
-            self._report(95, 'Cleaning up...')
+            self._report(95, 'Cleaning up temporary files...')
             for path in [temp_mask_raster, temp_mask_vector, temp_filtered]:
                 if path and os.path.exists(path):
                     try:
@@ -194,7 +231,8 @@ class WorkerThread(QThread):
             return {
                 'success':     True,
                 'output_path': self.output_path,
-                'message':     f'Black frame removed successfully!\n\nOutput saved to:\n{self.output_path}'
+                'message':     (f'Black frame removed successfully!\n\n'
+                                f'Output saved to:\n{self.output_path}')
             }
 
         except Exception as e:
@@ -269,25 +307,26 @@ class BlackFrameRemoverDialog(QDialog):
         thresh_row.addWidget(self.threshold_spin)
         set_layout.addLayout(thresh_row)
         hint_row = QHBoxLayout()
-        hint_row.addWidget(QLabel('0 = pure black only'))
+        hint_row.addWidget(QLabel('0 = NoDataonly'))
         hint_row.addStretch()
-        hint_row.addWidget(QLabel('100 = aggressive'))
+        hint_row.addWidget(QLabel('100 = include dark DNs'))
         set_layout.addLayout(hint_row)
 
         set_layout.addSpacing(8)
 
-        # Edge smoothing (morphological closing) ← THE FIX
+        # Edge smoothing (morphological closing)
         set_layout.addWidget(QLabel(
-            'Edge smoothing: prevents dark image pixels near edges from being removed:\n'
-            '(increase if dark fields or forests near the border are incorrectly cut)'))
+            'Edge smoothing: morphological closing to retain valid dark DNs near the\n'
+            'image footprint. Raise if dark terrain or vegetation near the border is\n'
+            'incorrectly masked. Higher values increase processing time on large rasters.'))
         closing_row = QHBoxLayout()
         self.closing_slider = QSlider(Qt.Horizontal)
         self.closing_slider.setRange(1, 51)
         self.closing_slider.setSingleStep(2)
-        self.closing_slider.setValue(21)
+        self.closing_slider.setValue(1)
         self.closing_spin = QSpinBox()
         self.closing_spin.setRange(1, 51)
-        self.closing_spin.setValue(21)
+        self.closing_spin.setValue(1)
         self.closing_spin.setSuffix('  px')
         self.closing_slider.valueChanged.connect(self.closing_spin.setValue)
         self.closing_spin.valueChanged.connect(self.closing_slider.setValue)
@@ -295,7 +334,7 @@ class BlackFrameRemoverDialog(QDialog):
         closing_row.addWidget(self.closing_spin)
         set_layout.addLayout(closing_row)
         hint_row2 = QHBoxLayout()
-        hint_row2.addWidget(QLabel('1 = no smoothing'))
+        hint_row2.addWidget(QLabel('1 = no smoothing (default)'))
         hint_row2.addStretch()
         hint_row2.addWidget(QLabel('51 = fill large dark areas'))
         set_layout.addLayout(hint_row2)
@@ -358,9 +397,8 @@ class BlackFrameRemoverDialog(QDialog):
         )
         if path:
             self.input_edit.setText(path)
-            if not self.output_edit.text():
-                base, ext = os.path.splitext(path)
-                self.output_edit.setText(base + '_clean' + (ext if ext else '.tif'))
+            base, ext = os.path.splitext(path)
+            self.output_edit.setText(base + '_clean' + (ext if ext else '.tif'))
 
     def _browse_output(self):
         path, _ = QFileDialog.getSaveFileName(
@@ -386,13 +424,14 @@ class BlackFrameRemoverDialog(QDialog):
         if not output_path.lower().endswith(('.tif', '.tiff')):
             output_path += '.tif'
 
-        # Closing size must be odd
+        # Closing size must be odd for a symmetric kernel
         closing_size = self.closing_spin.value()
         if closing_size % 2 == 0:
             closing_size += 1
 
         self.run_btn.setEnabled(False)
         self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         self.status_label.setText('Starting...')
 
@@ -404,15 +443,29 @@ class BlackFrameRemoverDialog(QDialog):
             add_alpha    = self.alpha_check.isChecked(),
         )
         self.worker.progress.connect(self._on_progress)
+        self.worker.busy.connect(self._on_busy)
         self.worker.finished.connect(self._on_finished)
         self.worker.start()
 
     def _on_progress(self, percent, message):
+        # Ensure we're in determinate mode before setting a value
+        if self.progress_bar.maximum() == 0:
+            self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(percent)
         self.status_label.setText(message)
 
+    def _on_busy(self, on, message):
+        if on:
+            # Range (0, 0) puts QProgressBar into indeterminate "marquee" mode
+            self.progress_bar.setRange(0, 0)
+            if message:
+                self.status_label.setText(message)
+        else:
+            self.progress_bar.setRange(0, 100)
+
     def _on_finished(self, result):
         self.run_btn.setEnabled(True)
+        self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(100 if result['success'] else 0)
         if result['success']:
             self.status_label.setText('✅ Completed successfully!')
