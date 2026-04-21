@@ -41,8 +41,8 @@ Instead of blindly making dark pixels transparent, the plugin:
 **One-click workflow:**
 Input Raster → Threshold (0-100) → Edge Smoothing (1-51px) → Alpha Band → Output GeoTIFF
 
-- **🎚️ Black Threshold**: 0=pure black, 100=aggressive (default: 15)
-- **🛡️ Edge Smoothing**: Prevents edge pixel loss (default: 1px)
+- **🎚️ Black Threshold**: 0=NoData Only, 100=include dark DNs (default: 15)
+- **🛡️ Edge Smoothing**: Morphological closing to retain valid dark DNs near the image footprint (default: 1px — off)
 - **⚡ Auto-load**: Result loads into QGIS canvas immediately
 
 ## 🎯 04 / Use Cases
